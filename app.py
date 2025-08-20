@@ -5,7 +5,7 @@ import numpy as np
 import streamlit as st
 import datetime
 
-st.set_page_config(page_title="NSE Options IV Dashboard (Fixed)", layout="wide")
+st.set_page_config(page_title="None12371", layout="wide")
 
 # ---- Helpers ----
 @st.cache_data(show_spinner=False, ttl=45)
@@ -57,12 +57,12 @@ def to_df(chain_json: dict) -> pd.DataFrame:
     return df.sort_values("strikePrice").reset_index(drop=True)
 
 # ---- UI ----
-st.title("📈 NSE Options IV Dashboard (Fixed)")
-st.caption("Sums IV by the **selected expiry only** (previous bug caused cross-expiry sums).")
+st.title("None12371")
+st.caption("Sums IV by the selected expiry and stores snapshots (timestamped) in-session.")
 
 with st.sidebar:
+    st.header("Controls & Snapshots")
     symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
-    st.caption("Tip: Switch between indices here.")
     refresh = st.slider("Auto-refresh (seconds)", 0, 60, 0)
     manual_expiry = st.text_input("Manual expiry (e.g., 21-Aug-2025). Leave blank to use dropdown.")
 
@@ -82,9 +82,8 @@ if df_all.empty:
     st.warning("No option rows received from NSE.")
     st.stop()
 
-# ---- FILTER BY EXPIRY (the fix) ----
+# Filter by expiry
 df = df_all[df_all["expiryDate"] == selected_expiry].copy()
-
 if df.empty:
     st.warning("No rows match the selected expiry. Try another expiry or clear the manual field.")
     st.stop()
@@ -92,17 +91,52 @@ if df.empty:
 sum_call_iv = float(np.nansum(df["CE_IV"]))  # sums only selected expiry
 sum_put_iv  = float(np.nansum(df["PE_IV"]))
 
+# Initialize snapshots store in session_state
+if "snapshots" not in st.session_state:
+    # structure: { expiry_str: [ {timestamp:..., call_iv:..., put_iv:...}, ... ] }
+    st.session_state.snapshots = {}
+
+# Append current snapshot for the selected expiry
+now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+snap = {"timestamp": now, "call_iv": sum_call_iv, "put_iv": sum_put_iv}
+
+# Create list for expiry if missing
+if selected_expiry not in st.session_state.snapshots:
+    st.session_state.snapshots[selected_expiry] = []
+
+# Append snapshot - only append if the last snapshot differs to avoid duplicates on rerun loops
+last = st.session_state.snapshots[selected_expiry][-1] if st.session_state.snapshots[selected_expiry] else None
+if (not last) or (last["call_iv"] != snap["call_iv"] or last["put_iv"] != snap["put_iv"]):
+    st.session_state.snapshots[selected_expiry].append(snap)
+
+# Top metrics
 c1, c2, c3 = st.columns(3)
 c1.metric("Σ Call IV (selected expiry)", f"{sum_call_iv:,.2f}")
 c2.metric("Σ Put IV (selected expiry)",  f"{sum_put_iv:,.2f}")
 c3.metric("Rows counted", f"{len(df):,}")
 
-st.caption(f"Last updated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Last calculated: {now}")
 
+# Expandable raw data
 with st.expander("Preview counted rows"):
     st.dataframe(df[["strikePrice", "CE_IV", "PE_IV"]], use_container_width=True)
 
+# Sidebar: show snapshot history for selected expiry
+with st.sidebar:
+    st.subheader(f"Snapshots — {selected_expiry}")
+    snaps = st.session_state.snapshots.get(selected_expiry, [])
+    if snaps:
+        snaps_df = pd.DataFrame(snaps)
+        # Show latest first
+        snaps_df = snaps_df.sort_values("timestamp", ascending=False).reset_index(drop=True)
+        st.dataframe(snaps_df, use_container_width=True)
+        csv = snaps_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download snapshots CSV", csv, file_name=f"snapshots_{selected_expiry}.csv", mime="text/csv")
+    else:
+        st.write("No snapshots yet. They appear when values change or on refresh.")
+
+# Auto-refresh handling
 if refresh and refresh > 0:
     st.caption(f"Auto-refreshing every {refresh} seconds…")
     time.sleep(refresh)
-    st.rerun()
+    st.experimental_rerun()
