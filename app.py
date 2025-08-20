@@ -71,4 +71,6 @@ if expiry:
         st.sidebar.download_button("Download CSV", csv, "snapshots.csv", "text/csv")
 
 # Auto-refresh every 10 minutes (600s)
-st_autorefresh = st.experimental_memo(ttl=600)(fetch_data)
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=600000, key="iv_refresh")
+
