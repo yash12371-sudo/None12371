@@ -57,7 +57,7 @@ def to_df(chain_json: dict) -> pd.DataFrame:
     return df.sort_values("strikePrice").reset_index(drop=True)
 
 # ---- UI ----
-st.title("None12371")
+st.title("Dashboard")
 st.caption("Sums IV by the selected expiry and stores snapshots (timestamped) in-session.")
 
 with st.sidebar:
