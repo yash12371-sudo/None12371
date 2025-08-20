@@ -4,7 +4,6 @@ import requests
 import pandas as pd
 from datetime import datetime
 
-st.image("logo.png", width=80)
 st.title("Dashboard")
 
 # Session state for snapshots
