@@ -1,3 +1,19 @@
+"""
+Magical, static-elegant Options Dashboard
+- Symbols: NIFTY, BANKNIFTY
+- Shows: Spot, Call IV Sum, Put IV Sum, Call Value, Put Value
+- Deltas: IV and Value vs last snapshot (neutral Δ ↑ / Δ ↓)
+- Top 2 strikes by Value (Call & Put)
+- Snapshot History (Cr/Lakh formatting) + CSV download
+- Auto-refresh every 10 minutes (captures snapshot automatically)
+- Manual "Refresh Now" button also captures a snapshot
+
+Notes:
+- Uses a robust NSE client (cookie warm-up + retries) to reduce JSON/401 issues.
+- Value per strike = OI × (MIN BidQty across that side for the selected expiry) × LTP.
+- IST timestamps (Asia/Kolkata).
+"""
+
 import time
 from datetime import datetime
 
@@ -9,19 +25,20 @@ import streamlit as st
 # =========================================================
 # Page Setup
 # =========================================================
-st.set_page_config(page_title="Dashboard", layout="wide")
+st.set_page_config(page_title="Options Dashboard", layout="wide")
 
-# ---------- Custom "Magical" CSS (neutral, no red/green) ----------
+# ---------- Static, elegant "magical" CSS (no red/green) ----------
 MAGICAL_CSS = """
 <style>
 /* Background */
 [data-testid="stAppViewContainer"] {
-  background: radial-gradient(1200px 800px at 20% 10%, #101524 0%, #0B0F1A 40%, #070A12 100%);
+  background: radial-gradient(1200px 800px at 20% 10%, #101524 0%, #0B0F1A 42%, #070A12 100%);
+  color: #EDEBFF;
 }
 
 /* Sidebar */
 section[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, rgba(16,21,36,0.9) 0%, rgba(11,15,26,0.95) 100%);
+  background: linear-gradient(180deg, rgba(16,21,36,0.94) 0%, rgba(11,15,26,0.98) 100%);
   border-right: 1px solid rgba(255,255,255,0.06);
 }
 
@@ -39,6 +56,7 @@ h1, h2, h3, h4, h5 {
   background: linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%);
   border: 1px solid rgba(255,255,255,0.08);
   box-shadow: 0 10px 24px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.05);
+  min-height: 110px;
 }
 
 /* Metric title */
@@ -113,18 +131,20 @@ try:
     from streamlit_autorefresh import st_autorefresh
     auto_count = st_autorefresh(interval=AUTO_INTERVAL_MS, key="auto_refresh_key")
 except Exception:
-    # Fallback if package isn't available: no auto-refresh
     auto_count = 0
     st.caption("Auto-refresh disabled (install `streamlit-autorefresh` to enable).")
 
-# For controlled snapshot on auto-refresh
+# Track ticks to know when to append snapshots
 if "auto_tick" not in st.session_state:
     st.session_state["auto_tick"] = auto_count
 
 # Last updated display (IST)
 IST = pytz.timezone("Asia/Kolkata")
 last_updated = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-st.markdown(f"<div class='muted'>⏳ Auto-refresh every 10 minutes &nbsp;|&nbsp; Last updated: {last_updated} IST</div>", unsafe_allow_html=True)
+st.markdown(
+    f"<div class='muted'>Auto-refresh every 10 minutes &nbsp;|&nbsp; Last updated: {last_updated} IST</div>",
+    unsafe_allow_html=True,
+)
 
 # =========================================================
 # NSE Client (robust session with cookie warm-up & retries)
@@ -160,7 +180,7 @@ class NSEClient:
                     last_err = Exception(f"HTTP {resp.status_code}")
                     time.sleep(sleep_between)
                     continue
-                # Some times content-type is wrong; try json anyway
+                # Sometimes content-type is not set correctly; still try JSON
                 try:
                     return resp.json()
                 except Exception as e:
@@ -179,7 +199,7 @@ nse = NSEClient()
 # Helpers
 # =========================================================
 def format_inr(v: float) -> str:
-    """Format a number in Cr/Lakh units for display."""
+    """Format number in Cr/Lakh for display."""
     if v is None:
         return "-"
     try:
@@ -202,7 +222,7 @@ def compute_metrics(data: dict, expiry: str):
       - Spot
       - Sum of Call IV / Put IV
       - Sum of Call Value / Put Value
-        Value per strike = OI × (MIN BidQty across that side for this expiry) × LTP
+        Value per strike = OI × (MIN BidQty across that side for the selected expiry) × LTP
       - Top 2 strikes by Value (Call & Put)
     """
     records = (data or {}).get("records", {})
@@ -210,11 +230,10 @@ def compute_metrics(data: dict, expiry: str):
 
     ce_rows, pe_rows = [], []
     for item in rows:
-        if item.get("expiryDate") != expiry:
-            continue
         strike = item.get("strikePrice")
         ce, pe = item.get("CE"), item.get("PE")
-        if ce:
+
+        if ce and ce.get("expiryDate") == expiry:
             ce_rows.append({
                 "strike": strike,
                 "iv": ce.get("impliedVolatility", 0) or 0.0,
@@ -222,7 +241,7 @@ def compute_metrics(data: dict, expiry: str):
                 "bidQty": ce.get("bidQty", 0) or 0,
                 "ltp": ce.get("lastPrice", 0) or 0.0,
             })
-        if pe:
+        if pe and pe.get("expiryDate") == expiry:
             pe_rows.append({
                 "strike": strike,
                 "iv": pe.get("impliedVolatility", 0) or 0.0,
@@ -269,7 +288,6 @@ def delta_text(curr, prev, kind="num"):
     Neutral delta string:
       kind="num" -> plain number delta with 2 decimals
       kind="inr" -> formatted using Cr/Lakh
-    Uses unicode arrows in neutral style.
     """
     if prev is None:
         return "Δ –"
@@ -301,7 +319,6 @@ def card(title: str, value: str, delta: str = ""):
 # Sidebar Controls
 # =========================================================
 st.sidebar.header("Controls")
-
 symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
 
 # Single API call; also fetch expiries from same response to reduce failures
@@ -359,16 +376,16 @@ with col2:
 
 with col3:
     card("Call Value",
-         format_inr(metrics["call_value_sum"]),
-         delta_text(metrics["call_value_sum"], prev_call_val, kind="inr"))
+        format_inr(metrics["call_value_sum"]),
+        delta_text(metrics["call_value_sum"], prev_call_val, kind="inr"))
 
 with col4:
     card("Put Value",
-         format_inr(metrics["put_value_sum"]),
-         delta_text(metrics["put_value_sum"], prev_put_val, kind="inr"))
+        format_inr(metrics["put_value_sum"]),
+        delta_text(metrics["put_value_sum"], prev_put_val, kind="inr"))
 
 # =========================================================
-# Top Strikes (sidebar, glowing box)
+# Top Strikes (sidebar, glowing boxes)
 # =========================================================
 st.sidebar.subheader("Top Strikes by Value")
 with st.sidebar.container():
@@ -394,7 +411,6 @@ with st.sidebar.container():
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
-# Append snapshot on (1) manual click or (2) auto refresh tick changed
 append_snapshot = False
 if refresh_btn:
     append_snapshot = True
@@ -406,19 +422,19 @@ if append_snapshot:
     ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     st.session_state["history"].append({
         "Time": ts,
-        "Spot": metrics["spot"],
-        "Call IV Sum": round(metrics["call_iv_sum"], 2),
-        "Put IV Sum": round(metrics["put_iv_sum"], 2),
-        "Call Value": float(metrics["call_value_sum"]),
-        "Put Value": float(metrics["put_value_sum"]),
         "Symbol": symbol,
         "Expiry": expiry,
+        "Spot": metrics["spot"],
+        "Call IV Sum": float(f"{metrics['call_iv_sum']:.2f}"),
+        "Put IV Sum": float(f"{metrics['put_iv_sum']:.2f}"),
+        "Call Value": float(metrics["call_value_sum"]),
+        "Put Value": float(metrics["put_value_sum"]),
     })
 
 st.subheader("Snapshot History")
 if st.session_state["history"]:
     hist_df = pd.DataFrame(st.session_state["history"])
-    # Display with formatted values
+    # Display with formatted values for readability
     show_df = hist_df.copy()
     show_df["Call Value"] = show_df["Call Value"].apply(format_inr)
     show_df["Put Value"]  = show_df["Put Value"].apply(format_inr)
@@ -428,4 +444,5 @@ if st.session_state["history"]:
     csv_bytes = hist_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download History CSV", data=csv_bytes, file_name="history.csv", mime="text/csv")
 else:
-    st.info("Snapshots will appear here every 10 minutes or when you click “Refresh Now”.")
+    st.info("Snapshots will appear every 10 minutes or when you click “Refresh Now”.")
+
