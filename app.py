@@ -1,142 +1,238 @@
-import time
+import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
-import streamlit as st
-import datetime
+import pytz
+import time
+from datetime import datetime
 
-st.set_page_config(page_title="None12371", layout="wide")
-
-# ---- Helpers ----
-@st.cache_data(show_spinner=False, ttl=45)
-def get_session():
-    """Warm up a session so NSE doesn't block us."""
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Referer": "https://www.nseindia.com/",
-        "DNT": "1",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-    })
-    # Warm up cookies
-    s.get("https://www.nseindia.com", timeout=10)
-    s.get("https://www.nseindia.com/option-chain", timeout=10)
-    return s
-
-def fetch_option_chain(symbol: str) -> dict:
-    s = get_session()
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    r = s.get(url, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-def to_df(chain_json: dict) -> pd.DataFrame:
-    rows = []
-    for row in chain_json.get("records", {}).get("data", []):
-        strike = row.get("strikePrice")
-        expiry = row.get("expiryDate")
-        ce = row.get("CE") or {}
-        pe = row.get("PE") or {}
-        rows.append({
-            "expiryDate": expiry,
-            "strikePrice": strike,
-            "CE_IV": ce.get("impliedVolatility"),
-            "PE_IV": pe.get("impliedVolatility"),
-        })
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    # Clean
-    df["strikePrice"] = pd.to_numeric(df["strikePrice"], errors="coerce")
-    for c in ["CE_IV", "PE_IV"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.sort_values("strikePrice").reset_index(drop=True)
-
-# ---- UI ----
+# --------------------------
+# Page setup
+# --------------------------
+st.set_page_config(page_title="Dashboard", layout="wide")
 st.title("Dashboard")
-st.caption("Sums IV by the selected expiry and stores snapshots (timestamped) in-session.")
 
-with st.sidebar:
-    st.header("Controls & Snapshots")
-    symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
-    refresh = st.slider("Auto-refresh (seconds)", 0, 60, 0)
-    manual_expiry = st.text_input("Manual expiry (e.g., 21-Aug-2025). Leave blank to use dropdown.")
-
-# Fetch once
+# --------------------------
+# Auto-refresh every 10 minutes
+# --------------------------
 try:
-    chain = fetch_option_chain(symbol)
-except Exception as e:
-    st.error(f"Failed to fetch option chain: {e}")
-    st.stop()
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    from streamlit import autorefresh as st_autorefresh
 
-expiry_list = chain.get("records", {}).get("expiryDates", []) or []
-selected_expiry = manual_expiry.strip() if manual_expiry else st.selectbox("Available expiries (from NSE)", expiry_list, index=0 if expiry_list else None)
-st.write(f"**Using expiry:** {selected_expiry}")
+count = st_autorefresh(interval=600000, key="auto_refresh")  # 10 min
 
-df_all = to_df(chain)
-if df_all.empty:
-    st.warning("No option rows received from NSE.")
-    st.stop()
+# --------------------------
+# NSE client
+# --------------------------
+class NSEClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/122.0.0.0 Safari/537.36"),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/option-chain",
+            "Connection": "keep-alive",
+        })
 
-# Filter by expiry
-df = df_all[df_all["expiryDate"] == selected_expiry].copy()
-if df.empty:
-    st.warning("No rows match the selected expiry. Try another expiry or clear the manual field.")
-    st.stop()
+    def _warm_cookies(self):
+        try:
+            self.session.get("https://www.nseindia.com/", timeout=10)
+        except Exception:
+            pass
 
-sum_call_iv = float(np.nansum(df["CE_IV"]))  # sums only selected expiry
-sum_put_iv  = float(np.nansum(df["PE_IV"]))
+    def get_json(self, url, max_tries=5, sleep_between=1.5):
+        last_err = None
+        for _ in range(max_tries):
+            try:
+                self._warm_cookies()
+                resp = self.session.get(url, timeout=12)
+                if resp.status_code in (401, 403):
+                    last_err = Exception(f"HTTP {resp.status_code}")
+                    time.sleep(sleep_between)
+                    continue
+                return resp.json()
+            except Exception as e:
+                last_err = e
+                time.sleep(sleep_between)
+        st.error(f"NSE API error: {last_err}")
+        return None
 
-# Initialize snapshots store in session_state
-if "snapshots" not in st.session_state:
-    # structure: { expiry_str: [ {timestamp:..., call_iv:..., put_iv:...}, ... ] }
-    st.session_state.snapshots = {}
+nse = NSEClient()
 
-# Append current snapshot for the selected expiry
-now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-snap = {"timestamp": now, "call_iv": sum_call_iv, "put_iv": sum_put_iv}
-
-# Create list for expiry if missing
-if selected_expiry not in st.session_state.snapshots:
-    st.session_state.snapshots[selected_expiry] = []
-
-# Append snapshot - only append if the last snapshot differs to avoid duplicates on rerun loops
-last = st.session_state.snapshots[selected_expiry][-1] if st.session_state.snapshots[selected_expiry] else None
-if (not last) or (last["call_iv"] != snap["call_iv"] or last["put_iv"] != snap["put_iv"]):
-    st.session_state.snapshots[selected_expiry].append(snap)
-
-# Top metrics
-c1, c2, c3 = st.columns(3)
-c1.metric("Σ Call IV (selected expiry)", f"{sum_call_iv:,.2f}")
-c2.metric("Σ Put IV (selected expiry)",  f"{sum_put_iv:,.2f}")
-c3.metric("Rows counted", f"{len(df):,}")
-
-st.caption(f"Last calculated: {now}")
-
-# Expandable raw data
-with st.expander("Preview counted rows"):
-    st.dataframe(df[["strikePrice", "CE_IV", "PE_IV"]], use_container_width=True)
-
-# Sidebar: show snapshot history for selected expiry
-with st.sidebar:
-    st.subheader(f"Snapshots — {selected_expiry}")
-    snaps = st.session_state.snapshots.get(selected_expiry, [])
-    if snaps:
-        snaps_df = pd.DataFrame(snaps)
-        # Show latest first
-        snaps_df = snaps_df.sort_values("timestamp", ascending=False).reset_index(drop=True)
-        st.dataframe(snaps_df, use_container_width=True)
-        csv = snaps_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download snapshots CSV", csv, file_name=f"snapshots_{selected_expiry}.csv", mime="text/csv")
+# --------------------------
+# Helpers
+# --------------------------
+def format_inr(value: float) -> str:
+    if value is None:
+        return "-"
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if v >= 1e7:
+        return f"{v/1e7:.2f} Cr"
+    elif v >= 1e5:
+        return f"{v/1e5:.2f} Lakh"
     else:
-        st.write("No snapshots yet. They appear when values change or on refresh.")
+        return f"{v:.0f}"
 
-# Auto-refresh handling
-if refresh and refresh > 0:
-    st.caption(f"Auto-refreshing every {refresh} seconds…")
-    time.sleep(refresh)
-    st.experimental_rerun()
+def fetch_option_chain(symbol: str):
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    return nse.get_json(url)
+
+def compute_metrics(data: dict, expiry: str):
+    records = (data or {}).get("records", {})
+    rows = records.get("data", []) or []
+
+    ce_rows, pe_rows = [], []
+    for item in rows:
+        if item.get("expiryDate") != expiry:
+            continue
+        ce, pe, strike = item.get("CE"), item.get("PE"), item.get("strikePrice")
+        if ce:
+            ce_rows.append({
+                "strike": strike,
+                "iv": ce.get("impliedVolatility", 0) or 0.0,
+                "oi": ce.get("openInterest", 0) or 0,
+                "bidQty": ce.get("bidQty", 0) or 0,
+                "ltp": ce.get("lastPrice", 0) or 0.0,
+            })
+        if pe:
+            pe_rows.append({
+                "strike": strike,
+                "iv": pe.get("impliedVolatility", 0) or 0.0,
+                "oi": pe.get("openInterest", 0) or 0,
+                "bidQty": pe.get("bidQty", 0) or 0,
+                "ltp": pe.get("lastPrice", 0) or 0.0,
+            })
+
+    call_iv_sum = sum(r["iv"] for r in ce_rows)
+    put_iv_sum = sum(r["iv"] for r in pe_rows)
+
+    def min_positive(rows_list):
+        vals = [r["bidQty"] for r in rows_list if r["bidQty"] > 0]
+        return min(vals) if vals else 0
+
+    min_call_bidqty = min_positive(ce_rows)
+    min_put_bidqty = min_positive(pe_rows)
+
+    for r in ce_rows:
+        r["value"] = r["oi"] * min_call_bidqty * r["ltp"]
+    for r in pe_rows:
+        r["value"] = r["oi"] * min_put_bidqty * r["ltp"]
+
+    call_value_sum = sum(r["value"] for r in ce_rows)
+    put_value_sum = sum(r["value"] for r in pe_rows)
+
+    top_calls = sorted(ce_rows, key=lambda x: x["value"], reverse=True)[:2]
+    top_puts = sorted(pe_rows, key=lambda x: x["value"], reverse=True)[:2]
+
+    spot_price = records.get("underlyingValue", None)
+
+    return {
+        "spot": spot_price,
+        "call_iv_sum": call_iv_sum,
+        "put_iv_sum": put_iv_sum,
+        "call_value_sum": call_value_sum,
+        "put_value_sum": put_value_sum,
+        "top_calls": top_calls,
+        "top_puts": top_puts,
+    }
+
+# --------------------------
+# Sidebar
+# --------------------------
+st.sidebar.header("Controls")
+symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
+
+chain_data = fetch_option_chain(symbol)
+if not chain_data or "records" not in chain_data:
+    st.stop()
+
+expiries = chain_data["records"].get("expiryDates", []) or []
+if not expiries:
+    st.error("No expiries found.")
+    st.stop()
+
+default_idx = 0
+if "selected_expiry" in st.session_state and st.session_state["selected_expiry"] in expiries:
+    default_idx = expiries.index(st.session_state["selected_expiry"])
+
+expiry = st.sidebar.selectbox("Select Expiry", expiries, index=default_idx)
+st.session_state["selected_expiry"] = expiry
+
+refresh_btn = st.sidebar.button("Refresh Now")
+
+# --------------------------
+# Metrics
+# --------------------------
+metrics = compute_metrics(chain_data, expiry)
+
+# Compare with last snapshot if available
+prev_call_val, prev_put_val, prev_call_iv, prev_put_iv = None, None, None, None
+if "history" in st.session_state and st.session_state["history"]:
+    prev = st.session_state["history"][-1]
+    prev_call_val = prev["Call Value"]
+    prev_put_val = prev["Put Value"]
+    prev_call_iv = prev["Call IV Sum"]
+    prev_put_iv = prev["Put IV Sum"]
+
+def diff_text(curr, prev, is_iv=False):
+    if prev is None:
+        return "–"
+    diff = curr - prev
+    if diff > 0:
+        return f"▲ {round(diff,2) if is_iv else format_inr(diff)}"
+    elif diff < 0:
+        return f"▼ {round(abs(diff),2) if is_iv else format_inr(abs(diff))}"
+    else:
+        return "No change"
+
+c0, c1, c2, c3, c4 = st.columns(5)
+c0.metric("Spot Price", f"{metrics['spot']:.2f}" if metrics['spot'] else "-")
+c1.metric("Call IV Sum", f"{metrics['call_iv_sum']:.2f}", diff_text(metrics["call_iv_sum"], prev_call_iv, True))
+c2.metric("Put IV Sum", f"{metrics['put_iv_sum']:.2f}", diff_text(metrics["put_iv_sum"], prev_put_iv, True))
+c3.metric("Call Value", format_inr(metrics["call_value_sum"]), diff_text(metrics["call_value_sum"], prev_call_val))
+c4.metric("Put Value", format_inr(metrics["put_value_sum"]), diff_text(metrics["put_value_sum"], prev_put_val))
+
+st.subheader("Top Strikes")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**Top 2 Calls**")
+    for r in metrics["top_calls"]:
+        st.write(f"Strike {r['strike']}: {format_inr(r['value'])}")
+with col2:
+    st.markdown("**Top 2 Puts**")
+    for r in metrics["top_puts"]:
+        st.write(f"Strike {r['strike']}: {format_inr(r['value'])}")
+
+# --------------------------
+# Snapshot History
+# --------------------------
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+
+if refresh_btn or count > 0:
+    ist = pytz.timezone("Asia/Kolkata")
+    ts = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["history"].append({
+        "Time": ts,
+        "Spot": metrics["spot"],
+        "Call IV Sum": round(metrics["call_iv_sum"], 2),
+        "Put IV Sum": round(metrics["put_iv_sum"], 2),
+        "Call Value": metrics["call_value_sum"],
+        "Put Value": metrics["put_value_sum"],
+    })
+
+st.subheader("Snapshot History")
+if st.session_state["history"]:
+    df = pd.DataFrame(st.session_state["history"])
+    show_df = df.copy()
+    show_df["Call Value"] = show_df["Call Value"].apply(format_inr)
+    show_df["Put Value"] = show_df["Put Value"].apply(format_inr)
+    st.dataframe(show_df, use_container_width=True)
+else:
+    st.info("Snapshots will appear here (auto every 10 min, or click Refresh Now).")
