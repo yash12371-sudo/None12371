@@ -110,7 +110,7 @@ try:
     c5.metric("Σ Put Value", format_inr(put_val))
     c6.metric("Spot Price", f"{spot:.2f}")
 
-    # --- Top Strikes Section (replaces formula note) ---
+    # --- Top Strikes Section ---
     st.subheader("🔥 Top Strikes")
     top_calls = df.sort_values("CallValue", ascending=False).head(2)[["strikePrice", "CallValue"]]
     top_puts = df.sort_values("PutValue", ascending=False).head(2)[["strikePrice", "PutValue"]]
@@ -136,36 +136,28 @@ try:
         "Expiry": expiry,
         "Call IV": round(call_iv, 2),
         "Put IV": round(put_iv, 2),
-        "Call Value": format_inr(call_val),
-        "Put Value": format_inr(put_val),
+        "Call Value": call_val,  # raw
+        "Put Value": put_val,    # raw
     }
 
     if "history" not in st.session_state:
         st.session_state["history"] = []
 
-    if refresh_button or st.session_state.get("last_refresh") != timestamp:
+    if refresh_button:
         st.session_state["history"].append(snapshot)
-        st.session_state["last_refresh"] = timestamp
 
     hist_df = pd.DataFrame(st.session_state["history"])
-    st.subheader("📜 Snapshot History")
-    st.dataframe(hist_df, use_container_width=True)
+    if not hist_df.empty:
+        hist_df_display = hist_df.copy()
+        hist_df_display["Call Value"] = hist_df_display["Call Value"].apply(format_inr)
+        hist_df_display["Put Value"] = hist_df_display["Put Value"].apply(format_inr)
 
-    # Download option with raw values
-    raw_hist = pd.DataFrame([
-        {
-            "Timestamp": h["Timestamp"],
-            "Symbol": h["Symbol"],
-            "Expiry": h["Expiry"],
-            "Call IV": h["Call IV"],
-            "Put IV": h["Put IV"],
-            "Call Value": call_val,
-            "Put Value": put_val,
-        }
-        for h in st.session_state["history"]
-    ])
-    csv = raw_hist.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Download History CSV", csv, "history.csv", "text/csv")
+        st.subheader("📜 Snapshot History")
+        st.dataframe(hist_df_display, use_container_width=True)
+
+        # Download option with raw values
+        csv = hist_df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download History CSV", csv, "history.csv", "text/csv")
 
 except Exception as e:
     st.error("⚠️ Failed to fetch data. Please try again later.")
