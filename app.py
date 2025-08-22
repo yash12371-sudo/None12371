@@ -47,26 +47,16 @@ def fetch_data(symbol: str, expiry: str):
         strike = o.get("strikePrice")
         ce, pe = o.get("CE"), o.get("PE")
 
-        ce_iv = ce.get("impliedVolatility") if ce else None
-        ce_oi = ce.get("openInterest") if ce else None
-        ce_bid_qty = ce.get("bidQty") if ce else None
-        ce_ltp = ce.get("lastPrice") if ce else None
-
-        pe_iv = pe.get("impliedVolatility") if pe else None
-        pe_oi = pe.get("openInterest") if pe else None
-        pe_bid_qty = pe.get("bidQty") if pe else None
-        pe_ltp = pe.get("lastPrice") if pe else None
-
         rows.append({
             "strikePrice": strike,
-            "CE_IV": ce_iv,
-            "CE_OI": ce_oi,
-            "CE_BidQty": ce_bid_qty,
-            "CE_LTP": ce_ltp,
-            "PE_IV": pe_iv,
-            "PE_OI": pe_oi,
-            "PE_BidQty": pe_bid_qty,
-            "PE_LTP": pe_ltp,
+            "CE_IV": ce.get("impliedVolatility") if ce else None,
+            "CE_OI": ce.get("openInterest") if ce else None,
+            "CE_BidQty": ce.get("bidQty") if ce else None,
+            "CE_LTP": ce.get("lastPrice") if ce else None,
+            "PE_IV": pe.get("impliedVolatility") if pe else None,
+            "PE_OI": pe.get("openInterest") if pe else None,
+            "PE_BidQty": pe.get("bidQty") if pe else None,
+            "PE_LTP": pe.get("lastPrice") if pe else None,
         })
 
     df = pd.DataFrame(rows)
@@ -75,11 +65,9 @@ def fetch_data(symbol: str, expiry: str):
     call_iv_sum = df["CE_IV"].dropna().sum()
     put_iv_sum = df["PE_IV"].dropna().sum()
 
-    # Minimum bid quantity
     min_call_bid_qty = df["CE_BidQty"].dropna().min() if not df["CE_BidQty"].dropna().empty else 0
     min_put_bid_qty = df["PE_BidQty"].dropna().min() if not df["PE_BidQty"].dropna().empty else 0
 
-    # Value calculations
     df["CallValue"] = df["CE_OI"].fillna(0) * min_call_bid_qty * df["CE_LTP"].fillna(0)
     df["PutValue"] = df["PE_OI"].fillna(0) * min_put_bid_qty * df["PE_LTP"].fillna(0)
 
@@ -88,31 +76,28 @@ def fetch_data(symbol: str, expiry: str):
 
     spot_price = records.get("underlyingValue", 0)
 
-    return call_iv_sum, put_iv_sum, call_value_sum, put_value_sum, spot_price, len(df)
+    return df, call_iv_sum, put_iv_sum, call_value_sum, put_value_sum, spot_price, len(df)
 
 # ==============================
 # Streamlit App
 # ==============================
 
 st.set_page_config(page_title="Dashboard", layout="wide")
-st.title("📈 Dashboard")
+st.title("📊 Dashboard")
 
 # Sidebar
-st.sidebar.header("Settings")
+st.sidebar.header("Dashboard Settings")
 symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
 expiries = get_expiries(symbol)
 expiry = st.sidebar.selectbox("Select Expiry", expiries)
 refresh_button = st.sidebar.button("🔄 Refresh Now")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Formula:** Call/Put Value = OI × Min Bid Qty × LTP")
 
 # Auto-refresh every 10 minutes
 st_autorefresh(interval=600000, key="datarefresh")
 
 # --- Fetch data ---
 try:
-    call_iv, put_iv, call_val, put_val, spot, rows_count = fetch_data(symbol, expiry)
+    df, call_iv, put_iv, call_val, put_val, spot, rows_count = fetch_data(symbol, expiry)
 
     # Display metrics
     c1, c2, c3 = st.columns(3)
@@ -125,7 +110,23 @@ try:
     c5.metric("Σ Put Value", format_inr(put_val))
     c6.metric("Spot Price", f"{spot:.2f}")
 
-    # Snapshot history
+    # --- Top Strikes Section (replaces formula note) ---
+    st.subheader("🔥 Top Strikes")
+    top_calls = df.sort_values("CallValue", ascending=False).head(2)[["strikePrice", "CallValue"]]
+    top_puts = df.sort_values("PutValue", ascending=False).head(2)[["strikePrice", "PutValue"]]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Top 2 Call Strikes**")
+        for _, row in top_calls.iterrows():
+            st.write(f"Strike {row['strikePrice']}: {format_inr(row['CallValue'])}")
+
+    with col2:
+        st.markdown("**Top 2 Put Strikes**")
+        for _, row in top_puts.iterrows():
+            st.write(f"Strike {row['strikePrice']}: {format_inr(row['PutValue'])}")
+
+    # --- Snapshot history ---
     tz = pytz.timezone("Asia/Kolkata")
     timestamp = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -135,8 +136,8 @@ try:
         "Expiry": expiry,
         "Call IV": round(call_iv, 2),
         "Put IV": round(put_iv, 2),
-        "Call Value": call_val,
-        "Put Value": put_val,
+        "Call Value": format_inr(call_val),
+        "Put Value": format_inr(put_val),
     }
 
     if "history" not in st.session_state:
@@ -147,14 +148,25 @@ try:
         st.session_state["last_refresh"] = timestamp
 
     hist_df = pd.DataFrame(st.session_state["history"])
-    st.subheader("📊 Snapshot History")
+    st.subheader("📜 Snapshot History")
     st.dataframe(hist_df, use_container_width=True)
 
-    # Download option
-    csv = hist_df.to_csv(index=False).encode("utf-8")
+    # Download option with raw values
+    raw_hist = pd.DataFrame([
+        {
+            "Timestamp": h["Timestamp"],
+            "Symbol": h["Symbol"],
+            "Expiry": h["Expiry"],
+            "Call IV": h["Call IV"],
+            "Put IV": h["Put IV"],
+            "Call Value": call_val,
+            "Put Value": put_val,
+        }
+        for h in st.session_state["history"]
+    ])
+    csv = raw_hist.to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download History CSV", csv, "history.csv", "text/csv")
 
 except Exception as e:
     st.error("⚠️ Failed to fetch data. Please try again later.")
     st.exception(e)
-
