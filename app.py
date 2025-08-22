@@ -83,7 +83,7 @@ def fetch_data(symbol: str, expiry: str):
 # ==============================
 
 st.set_page_config(page_title="Dashboard", layout="wide")
-st.title("📊 Dashboard")
+st.title("Dashboard")
 
 # Sidebar
 st.sidebar.header("Dashboard Settings")
@@ -152,7 +152,7 @@ try:
         hist_df_display["Call Value"] = hist_df_display["Call Value"].apply(format_inr)
         hist_df_display["Put Value"] = hist_df_display["Put Value"].apply(format_inr)
 
-        st.subheader("📜 Snapshot History")
+        st.subheader("Snapshot History")
         st.dataframe(hist_df_display, use_container_width=True)
 
         # Download option with raw values
