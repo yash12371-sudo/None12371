@@ -1,154 +1,142 @@
-import streamlit as st
-import pandas as pd
+
+import os
+import csv
 import requests
-import pytz
+import pandas as pd
 from datetime import datetime
+import pytz
+import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ==============================
-# Utility Functions
-# ==============================
-
-def fetch_option_chain(symbol: str, expiry: str):
-    """Fetch option chain data for given symbol and expiry from NSE."""
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    session = requests.Session()
-    response = session.get(url, headers=headers, timeout=10)
-    data = response.json()
-
-    # Filter by expiry
-    records = data.get("records", {}).get("data", [])
-    filtered = [r for r in records if r.get("expiryDate") == expiry]
-    return filtered
-
-def format_large_number(num: float) -> str:
-    """Format number into Lakh / Crore for readability."""
-    if num >= 1e7:
-        return f"{num/1e7:.2f} Cr"
-    elif num >= 1e5:
-        return f"{num/1e5:.2f} L"
-    else:
-        return f"{num:.2f}"
-
-def calculate_values(filtered_data, side: str):
-    """Calculate sum of OI × min bid qty × LTP for given side (CE/PE)."""
-    total_value = 0
-    for record in filtered_data:
-        option = record.get(side)
-        if option:
-            oi = option.get("openInterest", 0)
-            bid_qtys = option.get("bidQty", [])
-            min_bid_qty = min(bid_qtys) if bid_qtys else 0
-            ltp = option.get("lastPrice", 0)
-            total_value += oi * min_bid_qty * ltp
-    return total_value
-
-def calculate_iv_sums(filtered_data):
-    """Calculate total Call IV and Put IV."""
-    call_iv_sum, put_iv_sum, rows = 0, 0, 0
-    for record in filtered_data:
-        ce, pe = record.get("CE"), record.get("PE")
-        if ce and "impliedVolatility" in ce:
-            call_iv_sum += ce["impliedVolatility"]
-        if pe and "impliedVolatility" in pe:
-            put_iv_sum += pe["impliedVolatility"]
-        if ce or pe:
-            rows += 1
-    return call_iv_sum, put_iv_sum, rows
-
-def get_symbol_price(symbol: str):
-    """Fetch spot price of NIFTY or BANKNIFTY."""
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    session = requests.Session()
-    response = session.get(url, headers=headers, timeout=10)
-    data = response.json()
-    return data.get("records", {}).get("underlyingValue", 0)
-
-# ==============================
-# Streamlit App
-# ==============================
-
 st.set_page_config(page_title="Dashboard", layout="wide")
+st.title("Dashboard")
 
-st.title("📈 Dashboard")
+# ----------------------------
+# Config
+# ----------------------------
+CSV_PATH = "snapshots.csv"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Referer": "https://www.nseindia.com/",
+}
 
-# Sidebar
-st.sidebar.header("Settings")
-symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
-expiry = st.sidebar.text_input("Enter Expiry (e.g. 21-Aug-2025)")
-refresh_button = st.sidebar.button("🔄 Refresh Now")
+IST = pytz.timezone("Asia/Kolkata")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "**Formula Note:**\n\n"
-    "Call/Put Value = OI × Min Bid Qty × LTP"
-)
-
-# Auto-refresh every 10 minutes
-st_autorefresh(interval=600000, key="datarefresh")
-
-if expiry:
-    try:
-        # Fetch option chain
-        data = fetch_option_chain(symbol, expiry)
-
-        # IV sums
-        call_iv, put_iv, rows = calculate_iv_sums(data)
-
-        # Call/Put values
-        call_value = calculate_values(data, "CE")
-        put_value = calculate_values(data, "PE")
-
-        # Spot price
-        spot_price = get_symbol_price(symbol)
-
-        # Current IST timestamp
-        ist = pytz.timezone("Asia/Kolkata")
-        timestamp = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-
-        # ====== Display ======
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Σ Call IV", f"{call_iv:.2f}")
-        col2.metric("Σ Put IV", f"{put_iv:.2f}")
-        col3.metric("Rows Counted", rows)
-
-        col4, col5, col6 = st.columns(3)
-        col4.metric("Σ Call Value", format_large_number(call_value))
-        col5.metric("Σ Put Value", format_large_number(put_value))
-        col6.metric(f"{symbol} Spot", f"{spot_price:.2f}")
-
-        # ====== Snapshot History ======
-        snapshot_row = {
-            "Timestamp": timestamp,
-            "Symbol": symbol,
-            "Expiry": expiry,
-            "Call IV": round(call_iv, 2),
-            "Put IV": round(put_iv, 2),
-            "Call Value": call_value,
-            "Put Value": put_value,
-        }
-
-        history_file = "history.csv"
+# ----------------------------
+# Helpers
+# ----------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_option_chain(symbol: str):
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    with requests.Session() as s:
+        s.headers.update(HEADERS)
         try:
-            history_df = pd.read_csv(history_file)
-        except FileNotFoundError:
-            history_df = pd.DataFrame()
+            s.get("https://www.nseindia.com/", timeout=8)
+            s.get("https://www.nseindia.com/option-chain", timeout=8)
+        except Exception:
+            pass
+        r = s.get(url, timeout=15)
+        r.raise_for_status()
+        return r.json()
 
-        history_df = pd.concat([history_df, pd.DataFrame([snapshot_row])], ignore_index=True)
-        history_df.to_csv(history_file, index=False)
+def compute_iv_sums(chain_json: dict, expiry: str):
+    if not chain_json or "records" not in chain_json:
+        return None, None, 0
+    rows = chain_json.get("records", {}).get("data", [])
+    filtered = [row for row in rows if row.get("expiryDate") == expiry]
+    call_sum = sum(row.get("CE", {}).get("impliedVolatility", 0) for row in filtered if row.get("CE"))
+    put_sum  = sum(row.get("PE", {}).get("impliedVolatility", 0) for row in filtered if row.get("PE"))
+    return float(call_sum), float(put_sum), len(filtered)
 
-        st.subheader("Snapshot History")
-        st.dataframe(history_df.tail(20))
+def load_history() -> pd.DataFrame:
+    if os.path.exists(CSV_PATH):
+        try:
+            return pd.read_csv(CSV_PATH)
+        except Exception:
+            return pd.DataFrame(columns=["Timestamp","Symbol","Expiry","Call IV","Put IV"])
+    return pd.DataFrame(columns=["Timestamp","Symbol","Expiry","Call IV","Put IV"])
 
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-else:
-    st.info("Please enter an expiry date to fetch data.")
+def append_history(ts: str, symbol: str, expiry: str, call_iv: float, put_iv: float):
+    exists = os.path.exists(CSV_PATH)
+    with open(CSV_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(["Timestamp","Symbol","Expiry","Call IV","Put IV"])
+        writer.writerow([ts, symbol, expiry, f"{call_iv:.6f}", f"{put_iv:.6f}"])
+
+def get_previous_snapshot(df: pd.DataFrame, symbol: str, expiry: str):
+    if df.empty:
+        return None
+    subset = df[(df["Symbol"] == symbol) & (df["Expiry"] == expiry)]
+    if subset.empty:
+        return None
+    return subset.sort_values("Timestamp").iloc[-1]
+
+# ----------------------------
+# Sidebar controls
+# ----------------------------
+with st.sidebar:
+    st.header("Controls")
+    symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY"], index=0)
+    reset = st.button("🗑️ Reset History (local)")
+    st.caption("Auto-refresh is fixed at 10 minutes. Use 'Refresh Now' to force an update.")
+
+if reset and os.path.exists(CSV_PATH):
+    os.remove(CSV_PATH)
+    st.sidebar.success("History cleared.")
+
+# Fetch data
+try:
+    data = fetch_option_chain(symbol)
+except Exception as e:
+    st.error(f"Failed to fetch option chain: {e}")
+    data = None
+
+# Expiry dropdown
+expiry = None
+if data and "records" in data:
+    expiries = data["records"].get("expiryDates", [])
+    if expiries:
+        expiry = st.selectbox("Select Expiry", expiries, index=0)
+
+# Compute and display
+if expiry:
+    call_iv, put_iv, nrows = compute_iv_sums(data, expiry)
+    if nrows == 0:
+        st.warning("No rows for the selected expiry. Try another expiry.")
+    else:
+        hist_df = load_history()
+        prev = get_previous_snapshot(hist_df, symbol, expiry)
+        prev_call = float(prev["Call IV"]) if prev is not None else None
+        prev_put  = float(prev["Put IV"]) if prev is not None else None
+
+        col1, col2, col3 = st.columns(3)
+        delta_call = None if prev_call is None else call_iv - prev_call
+        delta_put  = None if prev_put  is None else put_iv  - prev_put
+
+        col1.metric("Σ Call IV (selected expiry)", f"{call_iv:,.2f}", None if delta_call is None else f"{delta_call:+.2f}")
+        col2.metric("Σ Put IV (selected expiry)",  f"{put_iv:,.2f}",  None if delta_put  is None else f"{delta_put:+.2f}")
+        col3.metric("Rows counted", f"{nrows:,}")
+
+        now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        st.caption(f"Last updated (IST): {now}")
+
+        should_save = (prev is None) or (abs(delta_call) > 1e-9) or (abs(delta_put) > 1e-9)
+        if should_save:
+            append_history(now, symbol, expiry, call_iv, put_iv)
+            hist_df = load_history()
+
+        with st.expander("Snapshot History (persistent CSV)"):
+            st.dataframe(hist_df.sort_values("Timestamp", ascending=False), use_container_width=True)
+        st.sidebar.subheader("Recent Snapshots")
+        st.sidebar.dataframe(hist_df.sort_values("Timestamp", ascending=False).head(25), height=350, use_container_width=True)
+        st.sidebar.download_button("Download Full CSV", hist_df.to_csv(index=False).encode("utf-8"), file_name="snapshots.csv", mime="text/csv")
+
+if st.button("🔄 Refresh Now"):
+    fetch_option_chain.clear()
+    st.rerun()
+
+st_autorefresh(interval=600000, key="iv_refresh_key")
