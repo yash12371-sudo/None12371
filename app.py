@@ -111,7 +111,7 @@ try:
     c6.metric("Spot Price", f"{spot:.2f}")
 
     # --- Top Strikes Section ---
-    st.subheader("🔥 Top Strikes")
+    st.subheader("Top Strikes")
     top_calls = df.sort_values("CallValue", ascending=False).head(2)[["strikePrice", "CallValue"]]
     top_puts = df.sort_values("PutValue", ascending=False).head(2)[["strikePrice", "PutValue"]]
 
