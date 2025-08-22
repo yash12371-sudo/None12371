@@ -83,7 +83,7 @@ def fetch_data(symbol: str, expiry: str):
 # ==============================
 
 st.set_page_config(page_title="Dashboard", layout="wide")
-st.title("📊 Dashboard")
+st.title("Dashboard")
 
 # Sidebar
 st.sidebar.header("Dashboard Settings")
