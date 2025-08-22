@@ -1,148 +1,164 @@
 import streamlit as st
 import requests
 import pandas as pd
-import datetime
+from datetime import datetime
 import pytz
+from streamlit_autorefresh import st_autorefresh
 
-# --------------------------
-# Session + headers for NSE
-# --------------------------
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/109.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.nseindia.com/"
-})
+# ==============================
+# Utility Functions
+# ==============================
 
-def refresh_cookies():
-    """Fetch cookies by hitting NSE homepage before API calls."""
-    try:
-        session.get("https://www.nseindia.com/", timeout=5)
-    except Exception:
-        pass  # ignore errors, cookies will still be set if successful
-
-# --------------------------
-# Helpers
-# --------------------------
-def format_inr_value(val):
-    if val >= 1e7:
-        return f"{val/1e7:.2f} Cr"
-    elif val >= 1e5:
-        return f"{val/1e5:.2f} Lakh"
+def format_inr(value: float) -> str:
+    """Format number in crore/lakh style"""
+    if value >= 1e7:
+        return f"{value/1e7:.2f} Cr"
+    elif value >= 1e5:
+        return f"{value/1e5:.2f} L"
     else:
-        return f"{val:.0f}"
+        return f"{value:.0f}"
 
-def get_expiries(symbol):
-    """Fetch available expiry dates for symbol (NIFTY/BANKNIFTY)."""
-    refresh_cookies()
+def get_expiries(symbol: str):
+    """Fetch all available expiries from NSE"""
     url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    try:
-        resp = session.get(url, timeout=10)
-        data = resp.json()
-        return data.get("records", {}).get("expiryDates", [])
-    except Exception as e:
-        st.error(f"Error fetching expiries for {symbol}: {e}")
-        return []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    session = requests.Session()
+    response = session.get(url, headers=headers, timeout=10)
+    data = response.json()
+    return data.get("records", {}).get("expiryDates", [])
 
-def fetch_data(symbol, expiry):
-    """Fetch option chain and compute sums + values."""
-    refresh_cookies()
+def fetch_data(symbol: str, expiry: str):
+    """Fetch option chain and compute IV sums and Value sums"""
     url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    resp = session.get(url, timeout=10)
-    data = resp.json()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    session = requests.Session()
+    response = session.get(url, headers=headers, timeout=10)
+    data = response.json()
 
-    ce_iv, pe_iv = 0, 0
-    ce_value, pe_value = 0, 0
-    call_strikes, put_strikes = [], []
+    records = data.get("records", {})
+    filtered = [
+        o for o in records.get("data", [])
+        if o.get("expiryDate") == expiry
+    ]
 
-    for item in data.get("records", {}).get("data", []):
-        strike = item.get("strikePrice")
+    # DataFrame for processing
+    rows = []
+    for o in filtered:
+        strike = o.get("strikePrice")
+        ce, pe = o.get("CE"), o.get("PE")
 
-        # ---- Call side ----
-        ce = item.get("CE")
-        if ce and ce.get("expiryDate") == expiry:
-            ce_iv += ce.get("impliedVolatility", 0) or 0
-            bid_qty = ce.get("bidQty", 0) or 0
-            oi = ce.get("openInterest", 0) or 0
-            ltp = ce.get("lastPrice", 0) or 0
-            call_val = oi * bid_qty * ltp
-            ce_value += call_val
-            call_strikes.append((strike, call_val))
-
-        # ---- Put side ----
-        pe = item.get("PE")
-        if pe and pe.get("expiryDate") == expiry:
-            pe_iv += pe.get("impliedVolatility", 0) or 0
-            bid_qty = pe.get("bidQty", 0) or 0
-            oi = pe.get("openInterest", 0) or 0
-            ltp = pe.get("lastPrice", 0) or 0
-            put_val = oi * bid_qty * ltp
-            pe_value += put_val
-            put_strikes.append((strike, put_val))
-
-    return ce_iv, pe_iv, ce_value, pe_value, call_strikes, put_strikes
-
-# --------------------------
-# Streamlit UI
-# --------------------------
-st.set_page_config(page_title="Dashboard", layout="wide")
-st.title("Dashboard")
-
-# Sidebar
-st.sidebar.header("Controls")
-symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
-
-expiries = get_expiries(symbol)
-expiry = st.sidebar.selectbox("Select Expiry", expiries) if expiries else None
-
-refresh = st.sidebar.button("Refresh Now")
-
-# History in session
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if expiry:
-    ce_iv, pe_iv, ce_value, pe_value, call_strikes, put_strikes = fetch_data(symbol, expiry)
-
-    ist = pytz.timezone("Asia/Kolkata")
-    timestamp = datetime.datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-
-    if refresh:
-        st.session_state.history.append({
-            "Time": timestamp,
-            "Call IV Sum": ce_iv,
-            "Put IV Sum": pe_iv,
-            "Call Value": ce_value,
-            "Put Value": pe_value
+        rows.append({
+            "strikePrice": strike,
+            "CE_IV": ce.get("impliedVolatility") if ce else None,
+            "CE_OI": ce.get("openInterest") if ce else None,
+            "CE_BidQty": ce.get("bidQty") if ce else None,
+            "CE_LTP": ce.get("lastPrice") if ce else None,
+            "PE_IV": pe.get("impliedVolatility") if pe else None,
+            "PE_OI": pe.get("openInterest") if pe else None,
+            "PE_BidQty": pe.get("bidQty") if pe else None,
+            "PE_LTP": pe.get("lastPrice") if pe else None,
         })
 
-    # Metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Call IV Sum", f"{ce_iv:.2f}")
-    col2.metric("Put IV Sum", f"{pe_iv:.2f}")
-    col3.metric("Call Value", format_inr_value(ce_value))
-    col4.metric("Put Value", format_inr_value(pe_value))
+    df = pd.DataFrame(rows)
 
-    # Top strikes
-    st.sidebar.subheader("Top Strikes by Value")
-    if call_strikes:
-        top_calls = sorted(call_strikes, key=lambda x: x[1], reverse=True)[:2]
-        st.sidebar.write("**Calls:**")
-        for strike, val in top_calls:
-            st.sidebar.write(f"{strike}: {format_inr_value(val)}")
-    if put_strikes:
-        top_puts = sorted(put_strikes, key=lambda x: x[1], reverse=True)[:2]
-        st.sidebar.write("**Puts:**")
-        for strike, val in top_puts:
-            st.sidebar.write(f"{strike}: {format_inr_value(val)}")
+    # --- Compute values ---
+    call_iv_sum = df["CE_IV"].dropna().sum()
+    put_iv_sum = df["PE_IV"].dropna().sum()
 
-    # Snapshot history
-    if st.session_state.history:
-        df = pd.DataFrame(st.session_state.history)
-        df["Call Value"] = df["Call Value"].apply(format_inr_value)
-        df["Put Value"] = df["Put Value"].apply(format_inr_value)
-        st.subheader("Snapshot History")
-        st.dataframe(df, use_container_width=True)
+    min_call_bid_qty = df["CE_BidQty"].dropna().min() if not df["CE_BidQty"].dropna().empty else 0
+    min_put_bid_qty = df["PE_BidQty"].dropna().min() if not df["PE_BidQty"].dropna().empty else 0
+
+    df["CallValue"] = df["CE_OI"].fillna(0) * min_call_bid_qty * df["CE_LTP"].fillna(0)
+    df["PutValue"] = df["PE_OI"].fillna(0) * min_put_bid_qty * df["PE_LTP"].fillna(0)
+
+    call_value_sum = df["CallValue"].sum()
+    put_value_sum = df["PutValue"].sum()
+
+    spot_price = records.get("underlyingValue", 0)
+
+    return df, call_iv_sum, put_iv_sum, call_value_sum, put_value_sum, spot_price, len(df)
+
+# ==============================
+# Streamlit App
+# ==============================
+
+st.set_page_config(page_title="Dashboard", layout="wide")
+st.title("📊 Dashboard")
+
+# Sidebar
+st.sidebar.header("Dashboard Settings")
+symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
+expiries = get_expiries(symbol)
+expiry = st.sidebar.selectbox("Select Expiry", expiries)
+refresh_button = st.sidebar.button("🔄 Refresh Now")
+
+# Auto-refresh every 10 minutes
+st_autorefresh(interval=600000, key="datarefresh")
+
+# --- Fetch data ---
+try:
+    df, call_iv, put_iv, call_val, put_val, spot, rows_count = fetch_data(symbol, expiry)
+
+    # Display metrics
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Σ Call IV", f"{call_iv:.2f}")
+    c2.metric("Σ Put IV", f"{put_iv:.2f}")
+    c3.metric("Rows Counted", rows_count)
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Σ Call Value", format_inr(call_val))
+    c5.metric("Σ Put Value", format_inr(put_val))
+    c6.metric("Spot Price", f"{spot:.2f}")
+
+    # --- Top Strikes Section ---
+    st.subheader("🔥 Top Strikes")
+    top_calls = df.sort_values("CallValue", ascending=False).head(2)[["strikePrice", "CallValue"]]
+    top_puts = df.sort_values("PutValue", ascending=False).head(2)[["strikePrice", "PutValue"]]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Top 2 Call Strikes**")
+        for _, row in top_calls.iterrows():
+            st.write(f"Strike {row['strikePrice']}: {format_inr(row['CallValue'])}")
+
+    with col2:
+        st.markdown("**Top 2 Put Strikes**")
+        for _, row in top_puts.iterrows():
+            st.write(f"Strike {row['strikePrice']}: {format_inr(row['PutValue'])}")
+
+    # --- Snapshot history ---
+    tz = pytz.timezone("Asia/Kolkata")
+    timestamp = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    snapshot = {
+        "Timestamp": timestamp,
+        "Symbol": symbol,
+        "Expiry": expiry,
+        "Call IV": round(call_iv, 2),
+        "Put IV": round(put_iv, 2),
+        "Call Value": call_val,  # raw
+        "Put Value": put_val,    # raw
+    }
+
+    if "history" not in st.session_state:
+        st.session_state["history"] = []
+
+    if refresh_button:
+        st.session_state["history"].append(snapshot)
+
+    hist_df = pd.DataFrame(st.session_state["history"])
+    if not hist_df.empty:
+        hist_df_display = hist_df.copy()
+        hist_df_display["Call Value"] = hist_df_display["Call Value"].apply(format_inr)
+        hist_df_display["Put Value"] = hist_df_display["Put Value"].apply(format_inr)
+
+        st.subheader("📜 Snapshot History")
+        st.dataframe(hist_df_display, use_container_width=True)
+
+        # Download option with raw values
+        csv = hist_df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download History CSV", csv, "history.csv", "text/csv")
+
+except Exception as e:
+    st.error("⚠️ Failed to fetch data. Please try again later.")
+    st.exception(e)
