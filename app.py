@@ -1,3 +1,7 @@
+# (Full improved app.py with improvements 1, 2, and 4)
+# --------------------------
+# Page setup
+# --------------------------
 import streamlit as st
 import requests
 import pandas as pd
@@ -5,9 +9,6 @@ import pytz
 import time
 from datetime import datetime
 
-# --------------------------
-# Page setup
-# --------------------------
 st.set_page_config(page_title="Dashboard", layout="wide")
 st.title("Dashboard")
 
@@ -114,7 +115,7 @@ def compute_metrics(data: dict, expiry: str):
 
     def min_positive(rows_list):
         vals = [r["bidQty"] for r in rows_list if r["bidQty"] > 0]
-        return min(vals) if vals else 0
+        return min(vals) if vals else 1
 
     min_call_bidqty = min_positive(ce_rows)
     min_put_bidqty = min_positive(pe_rows)
@@ -165,10 +166,14 @@ expiry = st.sidebar.selectbox("Select Expiry", expiries, index=default_idx)
 st.session_state["selected_expiry"] = expiry
 
 refresh_btn = st.sidebar.button("Refresh Now")
+if st.sidebar.button("Clear History"):
+    st.session_state["history"] = []
 
 # --------------------------
-# Metrics
+# Metrics Section
 # --------------------------
+st.subheader("📊 Metrics")
+
 metrics = compute_metrics(chain_data, expiry)
 
 # Compare with last snapshot if available
@@ -191,14 +196,24 @@ def diff_text(curr, prev, is_iv=False):
     else:
         return "No change"
 
-c0, c1, c2, c3, c4 = st.columns(5)
-c0.metric("Spot Price", f"{metrics['spot']:.2f}" if metrics['spot'] else "-")
-c1.metric("Call IV Sum", f"{metrics['call_iv_sum']:.2f}", diff_text(metrics["call_iv_sum"], prev_call_iv, True))
-c2.metric("Put IV Sum", f"{metrics['put_iv_sum']:.2f}", diff_text(metrics["put_iv_sum"], prev_put_iv, True))
-c3.metric("Call Value", format_inr(metrics["call_value_sum"]), diff_text(metrics["call_value_sum"], prev_call_val))
-c4.metric("Put Value", format_inr(metrics["put_value_sum"]), diff_text(metrics["put_value_sum"], prev_put_val))
+c0, c1, c2 = st.columns(3)
 
-st.subheader("Top Strikes")
+with c0:
+    st.metric("Spot Price", f"{metrics['spot']:.2f}" if metrics['spot'] else "-")
+
+with c1:
+    st.metric("Call IV Sum", f"{metrics['call_iv_sum']:.2f}", diff_text(metrics["call_iv_sum"], prev_call_iv, is_iv=True))
+    st.metric("Call Value", format_inr(metrics["call_value_sum"]), diff_text(metrics["call_value_sum"], prev_call_val))
+
+with c2:
+    st.metric("Put IV Sum", f"{metrics['put_iv_sum']:.2f}", diff_text(metrics["put_iv_sum"], prev_put_iv, is_iv=True))
+    st.metric("Put Value", format_inr(metrics["put_value_sum"]), diff_text(metrics["put_value_sum"], prev_put_val))
+
+# --------------------------
+# Top Strikes Section
+# --------------------------
+st.subheader(f"Top Strikes (Expiry: {expiry})")
+
 col1, col2 = st.columns(2)
 with col1:
     st.markdown("**Top 2 Calls**")
@@ -212,6 +227,8 @@ with col2:
 # --------------------------
 # Snapshot History
 # --------------------------
+st.subheader("📜 Snapshot History")
+
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
@@ -220,6 +237,8 @@ if refresh_btn or count > 0:
     ts = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
     st.session_state["history"].append({
         "Time": ts,
+        "Symbol": symbol,
+        "Expiry": expiry,
         "Spot": metrics["spot"],
         "Call IV Sum": round(metrics["call_iv_sum"], 2),
         "Put IV Sum": round(metrics["put_iv_sum"], 2),
@@ -227,12 +246,15 @@ if refresh_btn or count > 0:
         "Put Value": metrics["put_value_sum"],
     })
 
-st.subheader("Snapshot History")
 if st.session_state["history"]:
     df = pd.DataFrame(st.session_state["history"])
     show_df = df.copy()
     show_df["Call Value"] = show_df["Call Value"].apply(format_inr)
     show_df["Put Value"] = show_df["Put Value"].apply(format_inr)
     st.dataframe(show_df, use_container_width=True)
+
+    # Download CSV button
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download History CSV", csv, "history.csv", "text/csv")
 else:
     st.info("Snapshots will appear here (auto every 10 min, or click Refresh Now).")
