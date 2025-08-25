@@ -14,7 +14,7 @@ st.set_page_config(page_title="Dashboard", layout="wide")
 st.title("Dashboard")
 
 # =========================
-# Auto-refresh every 10 minutes
+# Auto-refresh every 10 minutes (frontend)
 # =========================
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -22,9 +22,9 @@ except ImportError:
     def st_autorefresh(*args, **kwargs):
         return 0
 
-_ = st_autorefresh(interval=600_000, key="auto_refresh")
+_ = st_autorefresh(interval=600_000, key="auto_refresh")  # 10 minutes
 
-# backend refresh guard
+# Backend guard so a snapshot is always logged ~every 10 minutes
 if "last_snapshot_time" not in st.session_state:
     st.session_state["last_snapshot_time"] = time.time()
 
@@ -41,11 +41,11 @@ refresh_btn = st.sidebar.button("Refresh Now")
 # Constants
 # =========================
 IST = pytz.timezone("Asia/Kolkata")
-RISK_FREE = 0.06
-DIV_YIELD = 0.00
+RISK_FREE = 0.06   # annualized
+DIV_YIELD = 0.00   # annualized
 
 # =========================
-# NSE client
+# NSE client (robust to 401/403)
 # =========================
 class NSEClient:
     def __init__(self):
@@ -121,7 +121,7 @@ def bs_delta_gamma(S, K, r, q, sigma, T, option_type: str):
         return 0.0, 0.0
     if option_type == "C":
         delta = math.exp(-q * T) * norm_cdf(d1)
-    else:
+    else:  # Put
         delta = -math.exp(-q * T) * norm_cdf(-d1)
     gamma = (math.exp(-q * T) * norm_pdf(d1)) / (S * sigma * math.sqrt(T))
     return delta, gamma
@@ -132,6 +132,7 @@ def nearest_index(sorted_list, x):
     return min(range(len(sorted_list)), key=lambda i: abs(sorted_list[i] - x))
 
 def parse_expiry_to_dt(expiry_str: str):
+    # Typical NSE formats like "21-Aug-2025"
     fmts = ["%d-%b-%Y", "%d-%b-%y"]
     dt_naive = None
     for f in fmts:
@@ -159,7 +160,7 @@ def fetch_option_chain(symbol: str):
     return nse.get_json(url)
 
 # =========================
-# Compute Metrics (simplified but extensible)
+# Core computations
 # =========================
 def compute_metrics(data: dict, symbol: str, expiry: str):
     recs = (data or {}).get("records", {})
@@ -200,10 +201,11 @@ def compute_metrics(data: dict, symbol: str, expiry: str):
     if not strikes:
         return None
 
-    # Sums
+    # IV sums (display in %)
     call_iv_sum = sum((r["iv"] * 100.0) for r in ce_rows)
     put_iv_sum  = sum((r["iv"] * 100.0) for r in pe_rows)
 
+    # Min positive bid qty per side (scaling used everywhere, as requested)
     def min_pos(rows):
         vals = [r["bidQty"] for r in rows if r["bidQty"] > 0]
         return min(vals) if vals else 1
@@ -211,36 +213,100 @@ def compute_metrics(data: dict, symbol: str, expiry: str):
     min_call_q = min_pos(ce_rows)
     min_put_q  = min_pos(pe_rows)
 
+    # Totals & Greeks-based exposures (scaled by min bid quantity)
     tot_call_oi, tot_put_oi = 0, 0
-    gex_net = 0.0
-    dex_net = 0.0
+    call_value_sum, put_value_sum = 0.0, 0.0
+    dex_net, gex_net = 0.0, 0.0
 
-    for r in ce_rows:
-        tot_call_oi += r["oi"]
-        sigma = max(r["iv"], 1e-6)
-        d, g = bs_delta_gamma(spot, r["strike"], r=RISK_FREE, q=DIV_YIELD, sigma=sigma, T=T, option_type="C")
-        dex_net += d * r["oi"] * min_call_q
-        gex_net += g * r["oi"] * min_call_q * (spot**2)
+    # For IV skew and Vanna/Charm we need ATM strike context
+    atm_idx = nearest_index(strikes, spot)
+    atm_strike = strikes[atm_idx] if atm_idx is not None else None
 
-    for r in pe_rows:
-        tot_put_oi += r["oi"]
-        sigma = max(r["iv"], 1e-6)
-        d, g = bs_delta_gamma(spot, r["strike"], r=RISK_FREE, q=DIV_YIELD, sigma=sigma, T=T, option_type="P")
-        dex_net += d * r["oi"] * min_put_q
-        gex_net -= g * r["oi"] * min_put_q * (spot**2)
+    # Maps for quick lookup
+    ce_map = {r["strike"]: r for r in ce_rows}
+    pe_map = {r["strike"]: r for r in pe_rows}
+
+    # Compute exposures and your Value metric
+    for s in strikes:
+        ce = ce_map.get(s)
+        pe = pe_map.get(s)
+
+        if ce and ce["oi"] > 0:
+            tot_call_oi += ce["oi"]
+            call_value_sum += ce["oi"] * min_call_q * ce["ltp"]
+            sigma_c = max(ce["iv"], 1e-6)
+            d_c, g_c = bs_delta_gamma(spot, s, r, q, sigma_c, T, "C")
+            dex_net += d_c * ce["oi"] * min_call_q
+            gex_net += g_c * ce["oi"] * min_call_q * (spot ** 2)
+
+        if pe and pe["oi"] > 0:
+            tot_put_oi += pe["oi"]
+            put_value_sum += pe["oi"] * min_put_q * pe["ltp"]
+            sigma_p = max(pe["iv"], 1e-6)
+            d_p, g_p = bs_delta_gamma(spot, s, r, q, sigma_p, T, "P")
+            dex_net += d_p * pe["oi"] * min_put_q       # d_p is negative
+            gex_net -= g_p * pe["oi"] * min_put_q * (spot ** 2)  # net convention: calls - puts
 
     pcr = (tot_put_oi / tot_call_oi) if tot_call_oi > 0 else None
 
+    # --- IV Skew near ATM (Put - Call)
+    def avg_iv_near_atm(window=1):
+        if atm_strike is None:
+            return None, None, None
+        idx = strikes.index(atm_strike)
+        span = strikes[max(0, idx - window): idx + window + 1]
+        call_ivs = [ce_map[s]["iv"] * 100.0 for s in span if s in ce_map]
+        put_ivs  = [pe_map[s]["iv"] * 100.0 for s in span if s in pe_map]
+        if not call_ivs or not put_ivs:
+            return None, None, None
+        c_iv = sum(call_ivs) / len(call_ivs)
+        p_iv = sum(put_ivs)  / len(put_ivs)
+        return c_iv, p_iv, (p_iv - c_iv)
+
+    call_iv_atm, put_iv_atm, iv_skew = avg_iv_near_atm(window=1)
+    curr_atm_iv = None
+    if call_iv_atm is not None and put_iv_atm is not None:
+        curr_atm_iv = (call_iv_atm + put_iv_atm) / 2.0  # %
+
+    # --- Max Pain (brute force over strikes present)
+    def compute_max_pain():
+        all_s = sorted(set([r["strike"] for r in ce_rows] + [r["strike"] for r in pe_rows]))
+        call_oi_map = {r["strike"]: r["oi"] for r in ce_rows}
+        put_oi_map  = {r["strike"]: r["oi"] for r in pe_rows}
+        best, best_pay = None, None
+        for s in all_s:
+            pay = 0
+            for k in all_s:
+                if s > k:  # calls ITM at settlement
+                    pay += call_oi_map.get(k, 0) * (s - k)
+                if k > s:  # puts ITM
+                    pay += put_oi_map.get(k, 0) * (k - s)
+            if best_pay is None or pay < best_pay:
+                best, best_pay = s, pay
+        return best
+
+    max_pain = compute_max_pain() if (ce_rows or pe_rows) else None
+
     return {
         "spot": spot,
+        "expiry": expiry,
         "call_iv_sum": call_iv_sum,
         "put_iv_sum":  put_iv_sum,
+        "call_value_sum": call_value_sum,
+        "put_value_sum":  put_value_sum,
         "total_call_oi": tot_call_oi,
         "total_put_oi":  tot_put_oi,
         "pcr": pcr,
+        "iv_skew": iv_skew,                 # % Put-Call near ATM
+        "call_iv_atm": call_iv_atm,         # % (for display if needed)
+        "put_iv_atm": put_iv_atm,           # %
+        "atm_iv_now": curr_atm_iv,          # % (used for Vanna hint)
+        "atm_strike": atm_strike,           # for Charm hint
+        "max_pain": max_pain,
         "dex_net": dex_net,
         "gex_net": gex_net,
-        # (future: add max pain, skew, vanna, charm explicitly)
+        "min_call_q": min_call_q,
+        "min_put_q":  min_put_q,
     }
 
 # =========================
@@ -263,48 +329,107 @@ expiry = st.sidebar.selectbox("Select Expiry", expiries)
 # =========================
 m = compute_metrics(data, symbol, expiry)
 if m is None:
-    st.error("Unable to compute metrics.")
+    st.error("Unable to compute metrics for the selected expiry.")
     st.stop()
 
+# Previous snapshot (for diffs & Vanna)
 prev = st.session_state.get("history", [])[-1] if st.session_state.get("history") else {}
 
 # =========================
-# Final Comment (Institutional Desk Summary)
+# Final Comment (Institutional Desk Summary; 1–2 lines)
 # =========================
 def final_comment(m, prev):
-    notes = []
+    phrases_pos = []
+    phrases_neg = []
+    modifiers   = []
 
-    # PCR
+    # --- PCR sentiment
     if m["pcr"] is not None:
         if m["pcr"] > 1.1:
-            notes.append("Put positions outweigh calls → bullish tilt")
+            phrases_pos.append("put positioning supports upside")
         elif m["pcr"] < 0.9:
-            notes.append("Calls dominate → bearish tilt")
+            phrases_neg.append("call positioning adds resistance")
 
-    # DEX
+    # --- Max Pain pull (only if meaningful distance >0.5%)
+    if m["max_pain"] and m["spot"]:
+        pull = (m["max_pain"] - m["spot"]) / m["spot"]
+        if pull > 0.005:
+            phrases_pos.append("expiry pull favors upticks")
+        elif pull < -0.005:
+            phrases_neg.append("expiry pull favors downticks")
+
+    # --- IV Skew (Put - Call) near ATM
+    if m["iv_skew"] is not None:
+        if m["iv_skew"] > 0.5:
+            phrases_neg.append("downside skew shows caution")
+        elif m["iv_skew"] < -0.5:
+            phrases_pos.append("upside skew shows appetite")
+
+    # --- OI Flow Δ since last snapshot
+    if prev:
+        d_call = m["total_call_oi"] - (prev.get("Total Call OI", 0) or 0)
+        d_put  = m["total_put_oi"]  - (prev.get("Total Put OI", 0)  or 0)
+        if abs(d_call) > 0 or abs(d_put) > 0:
+            if d_put > d_call * 1.1:
+                phrases_pos.append("fresh put build-up aids bids")
+            elif d_call > d_put * 1.1:
+                phrases_neg.append("fresh call build-up caps rallies")
+
+    # --- Dealer Delta Exposure
     if m["dex_net"] > 0:
-        notes.append("Dealer hedging adds upside support")
+        phrases_pos.append("dealer hedging adds support")
     elif m["dex_net"] < 0:
-        notes.append("Dealer hedging adds downside pressure")
+        phrases_neg.append("dealer hedging adds pressure")
 
-    # GEX
+    # --- Vanna (ATM IV change vs prev)
+    prev_atm_iv = prev.get("ATM IV (near)")
+    if m["atm_iv_now"] is not None and prev_atm_iv is not None:
+        dv = m["atm_iv_now"] - prev_atm_iv
+        if dv > 0.3:
+            modifiers.append("rising IV fuels hedge buying")
+        elif dv < -0.3:
+            modifiers.append("IV ease reduces hedge demand")
+
+    # --- Charm (moneyness proxy)
+    if m["atm_strike"] is not None and m["spot"] is not None:
+        if m["spot"] >= m["atm_strike"]:
+            modifiers.append("time-decay drift leans up")
+        else:
+            modifiers.append("time-decay drift leans down")
+
+    # --- Gamma regime
     if m["gex_net"] > 0:
-        notes.append("Positive gamma dampens volatility")
+        modifiers.append("positive gamma may keep moves controlled")
     elif m["gex_net"] < 0:
-        notes.append("Negative gamma may amplify moves")
+        modifiers.append("negative gamma can amplify moves")
 
-    if not notes:
-        return "Flows mixed — no clear edge. Market likely sideways."
+    # Build a short, simple 1–2 line summary
+    # Priority: dominant tilt sentence + regime/modifier sentence
+    pos_score = len(phrases_pos)
+    neg_score = len(phrases_neg)
 
-    # combine to 1–2 lines
-    summary = "; ".join(notes)
-    return summary
+    if pos_score > neg_score + 1:
+        first = "Bullish bias — " + ", ".join(phrases_pos[:2])
+    elif neg_score > pos_score + 1:
+        first = "Bearish bias — " + ", ".join(phrases_neg[:2])
+    else:
+        # mixed or close
+        mix = phrases_pos[:1] + phrases_neg[:1]
+        first = "Flows mixed — " + ", ".join(mix) if mix else "Flows mixed — positioning balanced"
+
+    second = ""
+    if modifiers:
+        second = ". " + "; ".join(modifiers[:2])
+
+    comment = (first + second).strip()
+    # Ensure one or two lines max: keep it concise
+    return comment
 
 st.subheader("Final Comment")
 st.caption(final_comment(m, prev))
 
 # =========================
-# Snapshot History
+# Snapshot History (auto + manual)
 # =========================
 if "history" not in st.session_state:
     st.session_state["history"] = []
@@ -314,16 +439,22 @@ if refresh_btn or auto_snapshot_due():
     st.session_state["history"].append({
         "Time": ts,
         "Symbol": symbol,
-        "Expiry": expiry,
+        "Expiry": m["expiry"],
         "Spot": m["spot"],
         "PCR": m["pcr"],
+        "Max Pain": m["max_pain"],
+        "IV Skew": m["iv_skew"],
+        "ATM IV (near)": m["atm_iv_now"],
         "DEX Net": m["dex_net"],
         "GEX Net": m["gex_net"],
+        "Total Call OI": m["total_call_oi"],
+        "Total Put OI":  m["total_put_oi"],
     })
 
 st.subheader("Snapshot History")
 if st.session_state["history"]:
     df = pd.DataFrame(st.session_state["history"])
     st.dataframe(df, use_container_width=True)
+    st.download_button("Download CSV", df.to_csv(index=False).encode(), "history.csv")
 else:
-    st.info("Snapshots will appear every ~10 minutes or on Refresh Now.")
+    st.info("Snapshots will appear here every ~10 minutes or on Refresh Now.")
