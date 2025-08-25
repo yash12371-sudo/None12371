@@ -50,7 +50,6 @@ IST = pytz.timezone("Asia/Kolkata")
 RISK_FREE = 0.06
 DIV_YIELD = 0.00
 
-# Lot sizes (adjust easily if NSE updates)
 call_dex = delta_c * ce["oi"] * min_call_q
 call_gex = gamma_c * ce["oi"] * min_call_q * (spot ** 2)
 
