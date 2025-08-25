@@ -14,7 +14,7 @@ st.set_page_config(page_title="Dashboard", layout="wide")
 st.title("Dashboard")
 
 # =========================
-# Auto-refresh every 10 minutes
+# Auto-refresh (10 minutes)
 # =========================
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -22,7 +22,7 @@ except ImportError:
     def st_autorefresh(*args, **kwargs):
         return 0
 
-_ = st_autorefresh(interval=600_000, key="auto_refresh")  # 10 minutes
+_ = st_autorefresh(interval=600_000, key="auto_refresh")
 
 if "last_snapshot_time" not in st.session_state:
     st.session_state["last_snapshot_time"] = time.time()
@@ -158,7 +158,7 @@ def fetch_option_chain(symbol: str):
     return nse.get_json(url)
 
 # =========================
-# Compute Metrics (with min bid qty scaling)
+# Compute Metrics (scaled by min bid qty)
 # =========================
 def compute_metrics(data: dict, symbol: str, expiry: str):
     recs = (data or {}).get("records", {})
@@ -168,8 +168,6 @@ def compute_metrics(data: dict, symbol: str, expiry: str):
         return None
 
     T = time_to_expiry_years(expiry)
-    r = RISK_FREE
-    q = DIV_YIELD
 
     ce_rows, pe_rows, strikes_all = [], [], []
     for item in rows:
@@ -199,19 +197,18 @@ def compute_metrics(data: dict, symbol: str, expiry: str):
     if not strikes:
         return None
 
-    # IV sums
+    # Sums
     call_iv_sum = sum((r["iv"] * 100.0) for r in ce_rows)
     put_iv_sum  = sum((r["iv"] * 100.0) for r in pe_rows)
 
+    # min bid qty scaling
     def min_pos(rows):
         vals = [r["bidQty"] for r in rows if r["bidQty"] > 0]
         return min(vals) if vals else 1
-
     min_call_q = min_pos(ce_rows)
     min_put_q  = min_pos(pe_rows)
 
     tot_call_oi, tot_put_oi = 0, 0
-    call_value_sum, put_value_sum = 0.0, 0.0
     dex_net, gex_net = 0.0, 0.0
 
     atm_idx = nearest_index(strikes, spot)
@@ -224,33 +221,27 @@ def compute_metrics(data: dict, symbol: str, expiry: str):
         pe = pe_map.get(s)
         if ce and ce["oi"] > 0:
             tot_call_oi += ce["oi"]
-            call_value_sum += ce["oi"] * min_call_q * ce["ltp"]
-            sigma_c = max(ce["iv"], 1e-6)
-            d_c, g_c = bs_delta_gamma(spot, s, r, q, sigma_c, T, "C")
+            d_c, g_c = bs_delta_gamma(spot, s, RISK_FREE, DIV_YIELD, max(ce["iv"],1e-6), T, "C")
             dex_net += d_c * ce["oi"] * min_call_q
             gex_net += g_c * ce["oi"] * min_call_q * (spot**2)
         if pe and pe["oi"] > 0:
             tot_put_oi += pe["oi"]
-            put_value_sum += pe["oi"] * min_put_q * pe["ltp"]
-            sigma_p = max(pe["iv"], 1e-6)
-            d_p, g_p = bs_delta_gamma(spot, s, r, q, sigma_p, T, "P")
+            d_p, g_p = bs_delta_gamma(spot, s, RISK_FREE, DIV_YIELD, max(pe["iv"],1e-6), T, "P")
             dex_net += d_p * pe["oi"] * min_put_q
             gex_net -= g_p * pe["oi"] * min_put_q * (spot**2)
 
-    pcr = (tot_put_oi / tot_call_oi) if tot_call_oi > 0 else None
+    pcr = (tot_put_oi / tot_call_oi) if tot_call_oi else None
 
-    # IV Skew near ATM
-    call_iv_atm, put_iv_atm, iv_skew = None, None, None
+    # IV skew near ATM
+    iv_skew, atm_iv_now = None, None
     if atm_strike is not None:
         idx = strikes.index(atm_strike)
         span = strikes[max(0, idx-1): idx+2]
         call_ivs = [ce_map[s]["iv"]*100.0 for s in span if s in ce_map]
         put_ivs  = [pe_map[s]["iv"]*100.0 for s in span if s in pe_map]
         if call_ivs and put_ivs:
-            call_iv_atm, put_iv_atm = sum(call_ivs)/len(call_ivs), sum(put_ivs)/len(put_ivs)
-            iv_skew = put_iv_atm - call_iv_atm
-
-    atm_iv_now = (call_iv_atm + put_iv_atm)/2 if call_iv_atm and put_iv_atm else None
+            iv_skew = (sum(put_ivs)/len(put_ivs)) - (sum(call_ivs)/len(call_ivs))
+            atm_iv_now = (sum(call_ivs)+sum(put_ivs))/(len(call_ivs)+len(put_ivs))
 
     # Max Pain
     def compute_max_pain():
@@ -261,56 +252,36 @@ def compute_metrics(data: dict, symbol: str, expiry: str):
         for s in all_s:
             pay = 0
             for k in all_s:
-                if s > k:
-                    pay += call_map.get(k, 0) * (s - k)
-                if k > s:
-                    pay += put_map.get(k, 0) * (k - s)
+                if s > k: pay += call_map.get(k, 0) * (s - k)
+                if k > s: pay += put_map.get(k, 0) * (k - s)
             if best_pay is None or pay < best_pay:
                 best, best_pay = s, pay
         return best
-
     max_pain = compute_max_pain() if (ce_rows or pe_rows) else None
 
     return {
-        "spot": spot,
-        "expiry": expiry,
-        "call_iv_sum": call_iv_sum,
-        "put_iv_sum": put_iv_sum,
-        "call_value_sum": call_value_sum,
-        "put_value_sum": put_value_sum,
-        "total_call_oi": tot_call_oi,
-        "total_put_oi": tot_put_oi,
-        "pcr": pcr,
-        "iv_skew": iv_skew,
-        "atm_iv_now": atm_iv_now,
-        "atm_strike": atm_strike,
+        "spot": spot, "expiry": expiry,
+        "call_iv_sum": call_iv_sum, "put_iv_sum": put_iv_sum,
+        "total_call_oi": tot_call_oi, "total_put_oi": tot_put_oi,
+        "pcr": pcr, "iv_skew": iv_skew,
+        "atm_iv_now": atm_iv_now, "atm_strike": atm_strike,
         "max_pain": max_pain,
-        "dex_net": dex_net,
-        "gex_net": gex_net,
-        "min_call_q": min_call_q,
-        "min_put_q": min_put_q,
+        "dex_net": dex_net, "gex_net": gex_net,
+        "min_call_q": min_call_q, "min_put_q": min_put_q
     }
 
 # =========================
-# Sidebar inputs
+# Sidebar
 # =========================
-symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY"])
+symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY","BANKNIFTY"])
 data = fetch_option_chain(symbol)
-if not data:
-    st.stop()
-
+if not data: st.stop()
 expiries = data["records"].get("expiryDates", []) or []
-if not expiries:
-    st.error("No expiries found.")
-    st.stop()
-
+if not expiries: st.error("No expiries found."); st.stop()
 expiry = st.sidebar.selectbox("Select Expiry", expiries)
 
 m = compute_metrics(data, symbol, expiry)
-if m is None:
-    st.error("Unable to compute metrics.")
-    st.stop()
-
+if not m: st.error("Unable to compute metrics."); st.stop()
 prev = st.session_state.get("history", [])[-1] if st.session_state.get("history") else {}
 
 # =========================
@@ -318,50 +289,39 @@ prev = st.session_state.get("history", [])[-1] if st.session_state.get("history"
 # =========================
 def final_comment(m, prev):
     pos, neg, mods = [], [], []
-
     if m["pcr"]:
-        if m["pcr"] > 1.1: pos.append("put buildup supports upside")
-        elif m["pcr"] < 0.9: neg.append("call positioning adds resistance")
-
+        if m["pcr"]>1.1: pos.append("put buildup supports upside")
+        elif m["pcr"]<0.9: neg.append("call positioning adds resistance")
     if m["max_pain"] and m["spot"]:
-        pull = (m["max_pain"] - m["spot"]) / m["spot"]
-        if pull > 0.005: pos.append("expiry pull favors upticks")
-        elif pull < -0.005: neg.append("expiry pull favors downticks")
-
+        pull=(m["max_pain"]-m["spot"])/m["spot"]
+        if pull>0.005: pos.append("expiry pull favors upticks")
+        elif pull<-0.005: neg.append("expiry pull favors downticks")
     if m["iv_skew"]:
-        if m["iv_skew"] > 0.5: neg.append("downside skew signals caution")
-        elif m["iv_skew"] < -0.5: pos.append("upside skew shows appetite")
-
+        if m["iv_skew"]>0.5: neg.append("downside skew signals caution")
+        elif m["iv_skew"]<-0.5: pos.append("upside skew shows appetite")
     if prev:
-        d_call = m["total_call_oi"] - (prev.get("Total Call OI", 0) or 0)
-        d_put  = m["total_put_oi"] - (prev.get("Total Put OI", 0) or 0)
-        if d_put > d_call * 1.1: pos.append("fresh put build-up aids bids")
-        elif d_call > d_put * 1.1: neg.append("fresh call build-up caps rallies")
-
-    if m["dex_net"] > 0: pos.append("dealer hedging adds support")
-    elif m["dex_net"] < 0: neg.append("dealer hedging adds pressure")
-
-    prev_iv = prev.get("ATM IV (near)")
+        d_call=m["total_call_oi"]-(prev.get("Total Call OI",0) or 0)
+        d_put=m["total_put_oi"]-(prev.get("Total Put OI",0) or 0)
+        if d_put>d_call*1.1: pos.append("fresh put build-up aids bids")
+        elif d_call>d_put*1.1: neg.append("fresh call build-up caps rallies")
+    if m["dex_net"]>0: pos.append("dealer hedging adds support")
+    elif m["dex_net"]<0: neg.append("dealer hedging adds pressure")
+    prev_iv=prev.get("ATM IV (near)")
     if m["atm_iv_now"] and prev_iv:
-        dv = m["atm_iv_now"] - prev_iv
-        if dv > 0.3: mods.append("rising IV fuels hedge demand")
-        elif dv < -0.3: mods.append("IV easing reduces hedge demand")
-
+        dv=m["atm_iv_now"]-prev_iv
+        if dv>0.3: mods.append("rising IV fuels hedge demand")
+        elif dv<-0.3: mods.append("IV easing reduces hedge demand")
     if m["atm_strike"] and m["spot"]:
-        if m["spot"] >= m["atm_strike"]: mods.append("time-decay drift leans up")
-        else: mods.append("time-decay drift leans down")
-
-    if m["gex_net"] > 0: mods.append("positive gamma keeps moves steady")
-    elif m["gex_net"] < 0: mods.append("negative gamma can amplify swings")
-
-    if len(pos) > len(neg)+1: first = "Bullish bias — " + ", ".join(pos[:2])
-    elif len(neg) > len(pos)+1: first = "Bearish bias — " + ", ".join(neg[:2])
+        mods.append("time-decay drift leans up" if m["spot"]>=m["atm_strike"] else "time-decay drift leans down")
+    if m["gex_net"]>0: mods.append("positive gamma keeps moves steady")
+    elif m["gex_net"]<0: mods.append("negative gamma can amplify swings")
+    if len(pos)>len(neg)+1: first="Bullish bias — "+", ".join(pos[:2])
+    elif len(neg)>len(pos)+1: first="Bearish bias — "+", ".join(neg[:2])
     else:
-        mix = pos[:1] + neg[:1]
-        first = "Flows mixed — " + ", ".join(mix) if mix else "Flows mixed — positioning balanced"
-
-    second = ". " + "; ".join(mods[:2]) if mods else ""
-    return (first + second).strip()
+        mix=pos[:1]+neg[:1]
+        first="Flows mixed — "+", ".join(mix) if mix else "Flows mixed — positioning balanced"
+    second=". "+ "; ".join(mods[:2]) if mods else ""
+    return (first+second).strip()
 
 st.subheader("Final Comment")
 st.caption(final_comment(m, prev))
@@ -369,30 +329,20 @@ st.caption(final_comment(m, prev))
 # =========================
 # Snapshot History
 # =========================
-if "history" not in st.session_state:
-    st.session_state["history"] = []
-
+if "history" not in st.session_state: st.session_state["history"]=[]
 if refresh_btn or auto_snapshot_due():
-    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    ts=datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     st.session_state["history"].append({
-        "Time": ts,
-        "Symbol": symbol,
-        "Expiry": m["expiry"],
-        "Spot": m["spot"],
-        "PCR": m["pcr"],
-        "Max Pain": m["max_pain"],
-        "IV Skew": m["iv_skew"],
-        "ATM IV (near)": m["atm_iv_now"],
-        "DEX Net": m["dex_net"],
-        "GEX Net": m["gex_net"],
-        "Total Call OI": m["total_call_oi"],
-        "Total Put OI": m["total_put_oi"],
+        "Time": ts,"Symbol":symbol,"Expiry":m["expiry"],"Spot":m["spot"],
+        "PCR":m["pcr"],"Max Pain":m["max_pain"],"IV Skew":m["iv_skew"],
+        "ATM IV (near)":m["atm_iv_now"],"DEX Net":m["dex_net"],"GEX Net":m["gex_net"],
+        "Total Call OI":m["total_call_oi"],"Total Put OI":m["total_put_oi"],
     })
 
 st.subheader("Snapshot History")
 if st.session_state["history"]:
-    df = pd.DataFrame(st.session_state["history"])
-    st.dataframe(df, use_container_width=True)
-    st.download_button("Download CSV", df.to_csv(index=False).encode(), "history.csv")
+    df=pd.DataFrame(st.session_state["history"])
+    st.dataframe(df,use_container_width=True)
+    st.download_button("Download CSV",df.to_csv(index=False).encode(),"history.csv")
 else:
     st.info("Snapshots will appear every ~10 minutes or on Refresh Now.")
